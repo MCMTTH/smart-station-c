@@ -1,0 +1,427 @@
+#ifndef SYSTEM_H
+#define SYSTEM_H
+
+#include <time.h>
+#include <stdint.h>
+
+/* ==========================
+ *  CẤU TRÚC DỮ LIỆU CHÍNH
+ * ==========================
+ *  Dùng để lưu trữ một lần đọc dữ liệu từ cảm biến.
+ *  Gồm có:
+ *    - ts:      thời điểm đọc (dạng epoch time)
+ *    - temperature: nhiệt độ (°C)
+ *    - humidity:    độ ẩm (%)
+ *    - gas_ppm:     nồng độ khí gas (ppm)
+ */
+typedef struct {
+    time_t ts;
+    float temperature;
+    float humidity;
+    int gas_ppm;
+} SensorData;
+
+
+/* ==========================
+ *  NGƯỠNG CẢNH BÁO
+ * ==========================
+ *  Nếu vượt quá ngưỡng này thì hệ thống sẽ ghi ALERT vào log.
+ */
+#define TEMP_THRESHOLD 35.0f   /* Nhiệt độ cảnh báo (°C) */
+#define GAS_THRESHOLD  300     /* Nồng độ khí cảnh báo (ppm) */
+
+
+/* ==========================
+ *  TÊN CÁC FILE LOG
+ * ==========================
+ */
+#define SYSTEM_LOG_FILE "system_log.txt"   /* Ghi log hệ thống (INFO, WARN, ERROR, ALERT) */
+#define DATA_LOG_FILE   "data_log.txt"     /* Ghi dữ liệu cảm biến thô dạng text */
+
+
+/* ==========================
+ *  NGUYÊN MẪU HÀM DÙNG CHUNG
+ * ==========================
+ *  Các module khác có thể include để dùng chung.
+ */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Mở và cấu hình cổng serial.
+ * Trả về file descriptor (fd) nếu thành công, -1 nếu lỗi.
+ */
+int setup_serial_port(const char* port_name);
+
+/* Phân tích chuỗi dạng "T H G" (ví dụ: "28.5 61.0 235")
+ * và ghi kết quả vào struct SensorData.
+ * Trả về 0 nếu thành công, -1 nếu sai định dạng.
+ */
+int parse_sensor_data(const char* line, SensorData* data);
+
+/* Hàm chính chạy trong tiến trình con (Collector).
+ * Nhiệm vụ:
+ *   - Mở cổng serial (hoặc mô phỏng nếu port_name = "SIM")
+ *   - Đọc dữ liệu cảm biến
+ *   - Phân tích và gửi struct SensorData qua pipe cho tiến trình cha.
+ */
+void start_collector(int write_pipe_fd, const char* port_name);
+
+/* Hàm tạo dữ liệu mô phỏng (để test mà không cần Arduino thật).
+ * Kết quả: buffer chứa chuỗi "T H G\n"
+ */
+void get_simulated_data(char* buffer, size_t buflen);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SYSTEM_H */
+#define _POSIX_C_SOURCE 200809L
+#include "system.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdarg.h>
+
+/* =====================================
+ * HÀM GHI TOÀN BỘ DỮ LIỆU RA PIPE (write đầy đủ)
+ * =====================================
+ * Vì system call write() có thể ghi không hết,
+ * nên ta cần vòng lặp để đảm bảo ghi đủ toàn bộ struct SensorData.
+ */
+static ssize_t write_full(int fd, const void* buf, size_t count) {
+    const uint8_t* p = (const uint8_t*)buf;
+    size_t left = count;
+    while (left > 0) {
+        ssize_t w = write(fd, p, left);
+        if (w < 0) {
+            if (errno == EINTR) continue;  // Nếu bị ngắt bởi tín hiệu, ghi lại
+            return -1;
+        }
+        left -= (size_t)w;
+        p += w;
+    }
+    return (ssize_t)count;
+}
+
+
+/* =====================================
+ * HÀM CẤU HÌNH CỔNG SERIAL (8N1, 9600 baud)
+ * =====================================
+ * - Dùng thư viện termios để cấu hình port /dev/ttyACM0
+ * - Đặt baud rate, bit dữ liệu, parity, stop bit
+ * - Dùng chế độ non-canonical để read() không bị block mãi
+ * - Trả về file descriptor (fd)
+ */
+int setup_serial_port(const char* port_name) {
+    if (!port_name) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Mở cổng serial: chế độ đọc/ghi, không làm thiết bị điều khiển terminal
+    int fd = open(port_name, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0) {
+        perror("open(serial)");
+        return -1;
+    }
+
+    // Tắt cờ NONBLOCK (để read() có thể chờ timeout VTIME)
+    int flags = fcntl(fd, F_GETFL);
+    if (flags >= 0) {
+        flags &= ~O_NONBLOCK;
+        fcntl(fd, F_SETFL, flags);
+    }
+
+    struct termios tio;
+    if (tcgetattr(fd, &tio) != 0) {
+        perror("tcgetattr");
+        close(fd);
+        return -1;
+    }
+
+    // Cài đặt tốc độ truyền 9600 baud
+    if (cfsetispeed(&tio, B9600) != 0 || cfsetospeed(&tio, B9600) != 0) {
+        perror("cfsetispeed/cfsetospeed");
+        close(fd);
+        return -1;
+    }
+
+    /* Cấu hình chế độ 8N1:
+     * - 8 bit dữ liệu
+     * - Không parity
+     * - 1 stop bit
+     */
+    cfmakeraw(&tio);
+    tio.c_cflag &= ~PARENB;
+    tio.c_cflag &= ~CSTOPB;
+    tio.c_cflag &= ~CSIZE;
+    tio.c_cflag |= CS8;
+    tio.c_cflag |= CREAD | CLOCAL;
+
+    /* Non-canonical mode: đọc từng gói dữ liệu mà không cần nhấn Enter.
+     * VTIME = 20 → timeout 2.0s
+     * VMIN  = 0  → không yêu cầu đủ số byte, chỉ cần hết thời gian là trả về.
+     */
+    tio.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    tio.c_iflag &= ~(IXON | IXOFF | IXANY | ICRNL);
+    tio.c_oflag &= ~OPOST;
+
+    tio.c_cc[VMIN]  = 0;
+    tio.c_cc[VTIME] = 20;
+
+    if (tcsetattr(fd, TCSANOW, &tio) != 0) {
+        perror("tcsetattr");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+
+/* =====================================
+ * HÀM PHÂN TÍCH CHUỖI DỮ LIỆU
+ * =====================================
+ * Nhận chuỗi dạng "T H G" (ví dụ "28.5 61.0 235")
+ * và ghi vào struct SensorData.
+ */
+int parse_sensor_data(const char* line, SensorData* data) {
+    if (!line || !data) return -1;
+
+    float t = 0.0f, h = 0.0f;
+    int g = 0;
+
+    int n = sscanf(line, " %f %f %d", &t, &h, &g);
+    if (n != 3) return -1;
+
+    // Kiểm tra giá trị hợp lý
+    if (t < -50.0f || t > 100.0f) return -1;
+    if (h < 0.0f || h > 120.0f) return -1;
+    if (g < 0) return -1;
+
+    data->temperature = t;
+    data->humidity = h;
+    data->gas_ppm = g;
+    return 0;
+}
+
+
+/* =====================================
+ * HÀM GIẢ LẬP DỮ LIỆU CẢM BIẾN
+ * =====================================
+ * Sinh ra chuỗi giả lập "T H G\n"
+ * để test chương trình khi không có phần cứng Arduino.
+ */
+void get_simulated_data(char* buffer, size_t buflen) {
+    static float t = 25.0f;
+    static float h = 50.0f;
+    static int g = 200;
+
+    // Mỗi lần gọi, tăng giá trị nhẹ để giả lập sự thay đổi
+    t += 0.1f;
+    if (t > 40.0f) t = 22.0f;
+    h += 0.2f;
+    if (h > 90.0f) h = 40.0f;
+    g += 3;
+    if (g > 600) g = 150;
+
+    if (buflen > 0)
+        snprintf(buffer, buflen, "%.1f %.1f %d\n", t, h, g);
+}
+
+
+/* =====================================
+ * HÀM GHI LOG HỆ THỐNG RA FILE
+ * =====================================
+ * Ghi vào file "system_log.txt" theo định dạng:
+ * [2025-10-14 20:00:00] INFO: Nội dung log
+ */
+static void system_log_append(const char* level, const char* fmt, ...) {
+    FILE* f = fopen(SYSTEM_LOG_FILE, "a");
+    if (!f) return;
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    char timestr[64];
+    strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", &tm_now);
+
+    fprintf(f, "[%s] %s: ", timestr, level);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fprintf(f, "\n");
+    fclose(f);
+}
+
+
+/* =====================================
+ * GHI DỮ LIỆU CẢM BIẾN RA FILE data_log.txt
+ * =====================================
+ * Lưu dạng text để tiện debug hoặc xem nhanh:
+ *   2025-10-14 20:00:00 28.5 60.2 235
+ */
+static void data_log_append(const SensorData* sd) {
+    if (!sd) return;
+    FILE* f = fopen(DATA_LOG_FILE, "a");
+    if (!f) return;
+
+    struct tm tm_now;
+    localtime_r(&sd->ts, &tm_now);
+    char timestr[64];
+    strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", &tm_now);
+    fprintf(f, "%s %.1f %.1f %d\n", timestr, sd->temperature, sd->humidity, sd->gas_ppm);
+    fclose(f);
+}
+
+
+/* =====================================
+ * HÀM CHÍNH CỦA TIẾN TRÌNH CON (COLLECTOR)
+ * =====================================
+ * 1. Mở cổng serial hoặc chạy chế độ mô phỏng
+ * 2. Liên tục đọc dữ liệu theo chuỗi “T H G\n”
+ * 3. Khi đủ 1 dòng, parse -> ghi vào struct SensorData
+ * 4. Gửi struct đó qua pipe cho tiến trình cha
+ * 5. Ghi log INFO / WARN / ERROR / ALERT
+ */
+void start_collector(int write_pipe_fd, const char* port_name) {
+    int serial_fd = -1;
+    int use_sim = 0;
+
+    if (!port_name) {
+        system_log_append("ERROR", "start_collector: port_name NULL");
+        return;
+    }
+
+    // Nếu port_name = "SIM" thì chạy chế độ giả lập
+    if (strcmp(port_name, "SIM") == 0) {
+        use_sim = 1;
+        system_log_append("INFO", "Collector chạy ở chế độ MÔ PHỎNG");
+    } else {
+        serial_fd = setup_serial_port(port_name);
+        if (serial_fd < 0) {
+            system_log_append("ERROR", "Không mở được cổng serial '%s': %s", port_name, strerror(errno));
+            use_sim = 1; // fallback sang mô phỏng
+        } else {
+            system_log_append("INFO", "Mở cổng serial '%s' thành công (fd=%d)", port_name, serial_fd);
+        }
+    }
+
+    char buf[256];
+    size_t pos = 0;
+
+    // Vòng lặp chính
+    while (1) {
+        ssize_t r = 0;
+
+        /* ===== CHẾ ĐỘ MÔ PHỎNG ===== */
+        if (use_sim) {
+            char line[128];
+            get_simulated_data(line, sizeof(line));
+            size_t llen = strlen(line);
+
+            // Giả lập như thể đang đọc từng byte từ serial
+            for (size_t i = 0; i < llen; ++i) {
+                buf[pos++] = line[i];
+                if (pos >= sizeof(buf)-1) pos = sizeof(buf)-2;
+                if (line[i] == '\n') {
+                    buf[pos] = '\0';
+                    if (pos > 0 && buf[pos-1] == '\n') buf[pos-1] = '\0';
+
+                    SensorData sd;
+                    if (parse_sensor_data(buf, &sd) == 0) {
+                        sd.ts = time(NULL);
+                        if (write_full(write_pipe_fd, &sd, sizeof(sd)) < 0) {
+                            perror("write(pipe)");
+                            system_log_append("ERROR", "Ghi pipe thất bại: %s", strerror(errno));
+                        } else {
+                            data_log_append(&sd);
+                            system_log_append("INFO", "Giả lập: T=%.1f H=%.1f G=%d", sd.temperature, sd.humidity, sd.gas_ppm);
+
+                            if (sd.temperature > TEMP_THRESHOLD)
+                                system_log_append("ALERT", "Nhiệt độ %.1f vượt ngưỡng %.1f", sd.temperature, (double)TEMP_THRESHOLD);
+                            if (sd.gas_ppm > GAS_THRESHOLD)
+                                system_log_append("ALERT", "Khí gas %d ppm vượt ngưỡng %d", sd.gas_ppm, GAS_THRESHOLD);
+                        }
+                    } else {
+                        system_log_append("WARN", "Sai định dạng dữ liệu mô phỏng: '%s'", buf);
+                    }
+                    pos = 0;
+                }
+            }
+            sleep(2);
+            continue;
+        }
+
+        /* ===== CHẾ ĐỘ THẬT (ARDUINO) ===== */
+        r = read(serial_fd, buf + pos, sizeof(buf) - pos - 1);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            perror("read(serial)");
+            system_log_append("ERROR", "Lỗi đọc serial: %s", strerror(errno));
+            sleep(1);
+            continue;
+        } else if (r == 0) {
+            // Hết thời gian timeout mà không có dữ liệu
+            continue;
+        } else {
+            pos += (size_t)r;
+            if (pos >= sizeof(buf)-1) {
+                buf[sizeof(buf)-1] = '\0';
+                system_log_append("WARN", "Chuỗi quá dài, bỏ qua: '%s'", buf);
+                pos = 0;
+                continue;
+            }
+
+            // Tìm ký tự '\n' để xác định hết 1 dòng
+            char* nl = memchr(buf, '\n', pos);
+            if (nl) {
+                size_t linelen = (size_t)(nl - buf);
+                char line[256];
+                if (linelen >= sizeof(line)) linelen = sizeof(line)-1;
+                memcpy(line, buf, linelen);
+                line[linelen] = '\0';
+
+                // Dịch phần còn lại lên đầu buffer
+                size_t remaining = pos - (linelen + 1);
+                if (remaining > 0) memmove(buf, nl + 1, remaining);
+                pos = remaining;
+
+                SensorData sd;
+                if (parse_sensor_data(line, &sd) == 0) {
+                    sd.ts = time(NULL);
+                    if (write_full(write_pipe_fd, &sd, sizeof(sd)) < 0) {
+                        perror("write(pipe)");
+                        system_log_append("ERROR", "Ghi pipe thất bại: %s", strerror(errno));
+                    } else {
+                        data_log_append(&sd);
+                        system_log_append("INFO", "Serial: T=%.1f H=%.1f G=%d", sd.temperature, sd.humidity, sd.gas_ppm);
+
+                        if (sd.temperature > TEMP_THRESHOLD)
+                            system_log_append("ALERT", "Nhiệt độ %.1f vượt ngưỡng %.1f", sd.temperature, (double)TEMP_THRESHOLD);
+                        if (sd.gas_ppm > GAS_THRESHOLD)
+                            system_log_append("ALERT", "Khí gas %d ppm vượt ngưỡng %d", sd.gas_ppm, GAS_THRESHOLD);
+                    }
+                } else {
+                    system_log_append("WARN", "Sai định dạng chuỗi serial: '%s'", line);
+                }
+            }
+        }
+    }
+
+    // Giải phóng tài nguyên khi thoát
+    if (serial_fd >= 0) close(serial_fd);
+    close(write_pipe_fd);
+}
+
